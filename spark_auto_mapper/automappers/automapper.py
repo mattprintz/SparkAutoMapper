@@ -28,7 +28,6 @@ class AutoMapper(AutoMapperContainer):
         drop_key_columns: bool = True,
         checkpoint_after_columns: Optional[int] = None,
         checkpoint_path: Optional[Union[str, Path]] = None,
-        reuse_existing_view: bool = False,
         use_schema: bool = True,
         include_extension: bool = False,
         include_null_properties: bool = False,
@@ -49,7 +48,6 @@ class AutoMapper(AutoMapperContainer):
         :param drop_key_columns: whether to drop the key columns at the end
         :param checkpoint_after_columns: checkpoint after how many columns have been processed
         :param checkpoint_path: Path where to store the checkpoints
-        :param reuse_existing_view: If view already exists, whether to reuse it or create a new one
         :param use_schema: apply schema to columns
         :param include_extension: By default we don't include extension elements since they take up a lot of schema.
                 If you're using extensions then set this
@@ -69,7 +67,6 @@ class AutoMapper(AutoMapperContainer):
         self.drop_key_columns: bool = drop_key_columns
         self.checkpoint_after_columns: Optional[int] = checkpoint_after_columns
         self.checkpoint_path: Optional[Union[str, Path]] = checkpoint_path
-        self.reuse_existing_view: bool = reuse_existing_view
         self.use_schema: bool = use_schema
         self.include_extension: bool = include_extension
         self.include_null_properties: bool = include_null_properties
@@ -192,6 +189,11 @@ class AutoMapper(AutoMapperContainer):
         return msg
 
     def transform(self, df: DataFrame) -> DataFrame:
+        # ensure a view is not being reused so it cannot be written over
+        assert not self.view or not SparkHelpers.spark_table_exists(
+            sql_ctx=df.sql_ctx, view=self.view
+        ), f"View '{self.view}' already exists and cannot be reused."
+
         # if source_view is specified then load that else assume that df is the source view
         source_df: DataFrame = df.sql_ctx.table(
             self.source_view
@@ -199,19 +201,13 @@ class AutoMapper(AutoMapperContainer):
         # if keys are not specified then add a __row_id column to both the source and the destination
         #   and use that as key
         if not self.keys or len(self.keys) == 0:
-            assert not self.view or not SparkHelpers.spark_table_exists(
-                sql_ctx=df.sql_ctx, view=self.view
-            )
             self.keys = [TEMPORARY_KEY]
             source_df = source_df.withColumn(
                 TEMPORARY_KEY, monotonically_increasing_id()
             )
 
-        # if view is specified then check if it exists
-        destination_df: DataFrame = df.sql_ctx.table(self.view) \
-            if self.view and self.reuse_existing_view and SparkHelpers.spark_table_exists(sql_ctx=df.sql_ctx,
-                                                                                          view=self.view) \
-            else source_df.select(self.keys)
+        # initialize a new dataframe to add columns too, starting with the keys
+        destination_df: DataFrame = source_df.select(self.keys)
 
         # rename key columns to avoid name clash if someone creates a column with that name
         renamed_key_columns: List[str] = []
@@ -275,6 +271,10 @@ class AutoMapper(AutoMapperContainer):
         # if view was specified then create that view
         if self.view:
             result_df.createOrReplaceTempView(self.view)
+
+        # Reset keys on object if TEMPORARY key was used.
+        if self.keys == [TEMPORARY_KEY]:
+            self.keys = []
         return result_df
 
     def register_child(self, dst_column: str, child: 'AutoMapperBase') -> None:
